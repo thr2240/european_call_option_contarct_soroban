@@ -1,4 +1,8 @@
-use soroban_sdk::{ contracttype, Address};
+use soroban_sdk::{ contracttype, Address, String, Env};
+
+pub(crate) const TEMPORARY_BUMP_AMOUNT: u32 = 17280; // 1 day
+pub(crate) const INSTANCE_BUMP_AMOUNT: u32 = 34560; // 2 days
+pub(crate) const PERSISTENT_BUMP_AMOUNT: u32 = 518400; // 30 days
 
 #[derive(Clone)]
 #[contracttype]
@@ -16,7 +20,9 @@ pub struct OptionInfo {
     // Timestamp of expiration Date
     pub expiration_date: u64,
     // Option Fee
-    pub premium: u32
+    pub premium: u32,
+    // Oracle contract id
+    pub oracle_contract_id: Address
 }
 
 

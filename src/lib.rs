@@ -4,10 +4,18 @@
 
 mod option;
 mod storage_types;
+mod oracle {
+    soroban_sdk::contractimport!(
+        file = "../oracle_soroban/target/wasm32-unknown-unknown/release/oracle.wasm"
+    );
+}
 
-use soroban_sdk:: {contract, contractimpl, token, Address, Env, unwrap::UnwrapOptimized};
+use crate::option::{
+    check_time_bound, deposite_escrow, get_buyer, is_buyer_entered, is_initialized, load_option,
+    save_option, set_buyer, set_init_time,
+};
 use crate::storage_types::{DataKey, OptionInfo};
-use crate::option::{save_option, load_option, deposite_escrow, check_time_bound, set_buyer, get_buyer, is_buyer_entered, is_initialized, set_init_time};
+use soroban_sdk::{contract, contractimpl, token, unwrap::UnwrapOptimized, Address, Env, log};
 
 #[contract]
 pub struct EuropeanCallOption;
@@ -15,15 +23,16 @@ pub struct EuropeanCallOption;
 #[contractimpl]
 impl EuropeanCallOption {
     pub fn init_option(
-        e: Env, 
+        e: Env,
         seller: Address,
         strike_price: u32,
         expiration_date: u64,
         premium: u32,
         escrow_token: Address,
         escrow_amount: u32,
-        underlying_token: Address)
-    {
+        underlying_token: Address,
+        oracle_contract_id: Address,
+    ) {
         if is_initialized(&e) {
             panic!("Option was already initialized");
         }
@@ -39,29 +48,32 @@ impl EuropeanCallOption {
                 underlying_token,
                 strike_price,
                 expiration_date,
-                premium
-            }
+                premium,
+                oracle_contract_id,
+            },
         );
         deposite_escrow(&e);
         set_init_time(&e, &e.ledger().timestamp());
     }
     pub fn buy_option(e: Env, buyer: Address) {
-        if !is_initialized(&e){
+        if !is_initialized(&e) {
             panic!("Option was not initialized");
         }
         let option = load_option(&e);
-        
+
         let premium_token_client = token::Client::new(&e, &option.escrow_token);
         let underlying_token_client = token::Client::new(&e, &option.underlying_token);
         let contract = e.current_contract_address();
-        
+
         buyer.require_auth();
 
         // Send premium to the seller
         premium_token_client.transfer(&buyer, &option.seller, &(option.premium as i128));
 
+        log!(&e, "option.premium {}");
         // Depositing escrowAmount * strikePrice
-        let deposit_amount = option.escrow_amount
+        let deposit_amount = option
+            .escrow_amount
             .checked_mul(option.strike_price)
             .unwrap_optimized() as i128;
 
@@ -71,7 +83,7 @@ impl EuropeanCallOption {
         set_buyer(&e, &buyer);
     }
 
-    pub fn exercise_option(e: Env, current_price: u32) {
+    pub fn exercise_option(e: Env) {
         if !check_time_bound(&e) {
             panic!("Expiration Date is not fulfilled");
         }
@@ -83,28 +95,41 @@ impl EuropeanCallOption {
         let contract = e.current_contract_address();
         let underlying_token_client = token::Client::new(&e, &option.underlying_token);
         let escrow_token_client = token::Client::new(&e, &option.escrow_token);
-        let deposited_amount = option.escrow_amount
+        let deposited_amount = option
+            .escrow_amount
             .checked_mul(option.strike_price)
             .unwrap_optimized() as i128;
         let buyer = get_buyer(&e);
 
-        if current_price < option.strike_price {
-            // Send strikePrice * escrowAmount to buyer
-            buyer.require_auth();    
-            underlying_token_client.transfer(&contract, &buyer, &deposited_amount);
+        let oracle_client = oracle::Client::new(&e, &option.oracle_contract_id);
+        let asset = oracle::Asset::Stellar(escrow_token_client.address.clone());
+        let current_price = oracle_client.lastprice(&asset);
 
-            // Send escrowAmount to seller
-            escrow_token_client.transfer(&contract, &option.seller, &(option.escrow_amount as i128));
+        if let Some(price_data) = current_price {
+            if price_data.price < option.strike_price as i128 {
+                // Send strikePrice * escrowAmount to buyer
+                buyer.require_auth();
+                underlying_token_client.transfer(&contract, &buyer, &deposited_amount);
+
+                // Send escrowAmount to seller
+                escrow_token_client.transfer(
+                    &contract,
+                    &option.seller,
+                    &(option.escrow_amount as i128),
+                );
+            } else {
+                option.seller.require_auth();
+                // Send strikePrice * escrowAmount to seller
+                underlying_token_client.transfer(&contract, &option.seller, &deposited_amount);
+
+                // Send escrowAmount to buyer
+                escrow_token_client.transfer(&contract, &buyer, &(option.escrow_amount as i128));
+            }
+            e.storage().instance().remove(&DataKey::OptionInfo);
+            e.storage().instance().remove(&DataKey::Buyer);
         } else {
-            option.seller.require_auth();
-            // Send strikePrice * escrowAmount to buyer
-            underlying_token_client.transfer(&contract, &option.seller, &deposited_amount);
-
-            // Send escrowAmount to seller
-            escrow_token_client.transfer(&contract, &buyer, &(option.escrow_amount as i128));
+            panic!("Failed to fetch price from Oracle");
         }
-        e.storage().instance().remove(&DataKey::OptionInfo);
-        e.storage().instance().remove(&DataKey::Buyer);
     }
 
     pub fn withdraw(e: Env) {
